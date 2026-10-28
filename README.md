@@ -1,6 +1,6 @@
-# 🌾 AgriRentGov - Smart Agriculture Equipment Rental Platform
+# 🌾 AGRIX : Government Sponsored Agricultural Equipment Rental Platform with Automated Auditing Log
 
-AgriRentGov is a premium, state-of-the-art web application designed to help farmers lease advanced agricultural machinery directly from cooperative hubs. The platform features role-based access, automated booking systems, upfront payment integrations, and comprehensive administrative metrics.
+AGRIX is a government-sponsored, state-of-the-art agricultural equipment rental platform with an automated auditing log designed to help farmers lease advanced agricultural machinery directly from cooperative hubs. The platform features role-based access, automated booking systems, upfront payment integrations, and comprehensive administrative metrics.
 
 ---
 

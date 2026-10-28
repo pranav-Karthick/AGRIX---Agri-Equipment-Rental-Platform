@@ -1,11 +1,11 @@
-# 🌾 AgriRentGov - Smart Agriculture Equipment Rental Platform
+# 🌾 AGRIX : Government Sponsored Agricultural Equipment Rental Platform with Automated Auditing Log
 ## Complete Project Walkthrough & Role-Based Work Processes
 
 ---
 
 ## 📌 1. Project Executive Overview
 
-**AgriRentGov** is a state-of-the-art agricultural equipment leasing and management platform tailored for cooperative hubs across **Tamil Nadu**. It connects farmers directly with government-backed cooperative machinery hubs, allowing seamless rental of Mahindra tractors, combine harvesters, rotavators, seed drills, and power tillers with transparent upfront billing, real-time job dispatches, and state-level audit metrics.
+**AGRIX** is a government-sponsored, state-of-the-art agricultural equipment leasing and management platform with automated auditing logs tailored for cooperative hubs across **Tamil Nadu**. It connects farmers directly with government-backed cooperative machinery hubs, allowing seamless rental of Mahindra tractors, combine harvesters, rotavators, seed drills, and power tillers with transparent upfront billing, real-time job dispatches, and state-level audit metrics.
 
 ```mermaid
 flowchart TD
