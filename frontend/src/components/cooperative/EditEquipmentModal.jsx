@@ -1,0 +1,450 @@
+// src/components/cooperative/EditEquipmentModal.jsx
+import React, { useState, useEffect } from 'react';
+import { X, Save, MapPin, ShieldCheck, Lock } from 'lucide-react';
+import { TN_DISTRICTS, getTaluksForDistrict } from '../../data/tnLocationData';
+
+export default function EditEquipmentModal({
+  equipment,
+  isOpen,
+  onClose,
+  onSaveEdit,
+  userDistrict,
+  lockDistrict
+}) {
+  if (!isOpen || !equipment) return null;
+
+  // Detect staff role and jurisdiction
+  const currentUser = JSON.parse(localStorage.getItem('agrirent_user') || '{}');
+  const isStaff = currentUser.role === 'Staff' || currentUser.role === 'Cooperative Staff';
+  const shouldLockDistrict = lockDistrict !== undefined ? lockDistrict : isStaff;
+  const staffDistrict = userDistrict || (isStaff ? currentUser.district : null);
+
+  const initialDistrict = (shouldLockDistrict && staffDistrict) ? staffDistrict : (equipment.district || 'Coimbatore');
+  const initialTaluks = getTaluksForDistrict(initialDistrict);
+  const initialTaluk = (equipment.taluk && initialTaluks.includes(equipment.taluk)) ? equipment.taluk : (initialTaluks[0] || 'Central');
+
+  const [name, setName] = useState(equipment.name || '');
+  const [category, setCategory] = useState(equipment.category || 'Tractor');
+  const [price, setPrice] = useState(equipment.price || equipment.rentalRate || 1800);
+  const [district, setDistrict] = useState(initialDistrict);
+  const [taluk, setTaluk] = useState(initialTaluk);
+  const [location, setLocation] = useState(equipment.location || `${initialTaluk} Hub, ${initialDistrict}`);
+  const [condition, setCondition] = useState(equipment.condition || 'good');
+  const [status, setStatus] = useState(equipment.status || 'Available');
+  const [imageUrl, setImageUrl] = useState(equipment.imageUrl || '');
+  const [manufacturer, setManufacturer] = useState(equipment.manufacturer || equipment.brand || 'Mahindra');
+
+  useEffect(() => {
+    if (equipment) {
+      setName(equipment.name || '');
+      setCategory(equipment.category || 'Tractor');
+      setPrice(equipment.rentalRate || equipment.price || 1800);
+      const d = (shouldLockDistrict && staffDistrict) ? staffDistrict : (equipment.district || 'Coimbatore');
+      const validT = getTaluksForDistrict(d);
+      const t = (equipment.taluk && validT.includes(equipment.taluk)) ? equipment.taluk : (validT[0] || 'Central');
+      setDistrict(d);
+      setTaluk(t);
+      setLocation(equipment.location || `${t} Hub, ${d}`);
+      setCondition(equipment.condition || 'good');
+      setStatus(equipment.status || 'Available');
+      setImageUrl(equipment.imageUrl || '');
+      setManufacturer(equipment.manufacturer || equipment.brand || 'Mahindra');
+    }
+  }, [equipment, userDistrict]);
+
+  const handleDistrictChange = (e) => {
+    if (shouldLockDistrict) return;
+    const selectedDist = e.target.value;
+    setDistrict(selectedDist);
+    const taluks = getTaluksForDistrict(selectedDist);
+    const firstTaluk = taluks[0] || 'Central';
+    setTaluk(firstTaluk);
+    setLocation(`${firstTaluk} Hub, ${selectedDist}`);
+  };
+
+  const handleTalukChange = (e) => {
+    const selectedTaluk = e.target.value;
+    setTaluk(selectedTaluk);
+    const activeDist = shouldLockDistrict ? (staffDistrict || district) : district;
+    setLocation(`${selectedTaluk} Hub, ${activeDist}`);
+  };
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    const activeDist = shouldLockDistrict ? (staffDistrict || district) : district;
+    const validTaluks = getTaluksForDistrict(activeDist);
+    const validTaluk = validTaluks.includes(taluk) ? taluk : (validTaluks[0] || activeDist);
+
+    onSaveEdit(equipment._id || equipment.id, {
+      name,
+      category,
+      price: parseFloat(price),
+      rentalRate: parseFloat(price),
+      district: activeDist,
+      taluk: validTaluk,
+      cooperativeHub: `${validTaluk} Hub`,
+      location,
+      condition,
+      status,
+      imageUrl,
+      manufacturer,
+      brand: manufacturer
+    });
+    onClose();
+  };
+
+  const activeDistrictForTaluks = shouldLockDistrict ? (staffDistrict || district) : district;
+  const availableTaluks = getTaluksForDistrict(activeDistrictForTaluks);
+
+  return (
+    <div
+      style={{
+        position: 'fixed',
+        inset: 0,
+        zIndex: 200,
+        backgroundColor: 'rgba(10, 15, 20, 0.85)',
+        backdropFilter: 'blur(12px)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: '1.5rem'
+      }}
+    >
+      <div
+        style={{
+          width: '100%',
+          maxWidth: '650px',
+          maxHeight: '90vh',
+          overflowY: 'auto',
+          backgroundColor: 'var(--color-surface)',
+          borderRadius: '24px',
+          padding: '2.5rem',
+          position: 'relative',
+          border: '1px solid var(--color-border)',
+          boxShadow: '0 25px 60px rgba(0, 0, 0, 0.7)'
+        }}
+      >
+        <button
+          onClick={onClose}
+          style={{
+            position: 'absolute',
+            top: '1.5rem',
+            right: '1.5rem',
+            background: 'var(--color-border)',
+            border: 'none',
+            color: 'var(--color-text)',
+            width: '34px',
+            height: '34px',
+            borderRadius: '50%',
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center'
+          }}
+        >
+          <X size={18} />
+        </button>
+
+        <span className="section-tag">EDIT MACHINERY DETAILS</span>
+        <h2 style={{ fontSize: '1.8rem', fontWeight: 800, color: 'var(--color-text)', marginBottom: '1.5rem' }}>
+          Edit {equipment.name}
+        </h2>
+
+        <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '1.2rem' }}>
+          
+          {/* Location Assignment: District & Taluk */}
+          <div style={{
+            padding: '1.2rem',
+            borderRadius: '16px',
+            backgroundColor: 'rgba(21, 128, 61, 0.08)',
+            border: '1px solid rgba(21, 128, 61, 0.25)',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '1rem'
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.5rem' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', color: '#4ade80', fontWeight: 700, fontSize: '0.9rem' }}>
+                <MapPin size={18} />
+                <span>Assigned District & Taluk Deployment</span>
+              </div>
+              {shouldLockDistrict && (
+                <span style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '0.35rem',
+                  fontSize: '0.75rem',
+                  fontWeight: 700,
+                  padding: '0.25rem 0.65rem',
+                  borderRadius: '20px',
+                  backgroundColor: 'rgba(34, 197, 94, 0.15)',
+                  color: '#4ade80',
+                  border: '1px solid rgba(34, 197, 94, 0.3)'
+                }}>
+                  <ShieldCheck size={14} />
+                  Staff Jurisdiction: {activeDistrictForTaluks}
+                </span>
+              )}
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+              <div>
+                <label style={{ display: 'block', fontSize: '0.82rem', color: 'var(--color-text)', marginBottom: '0.35rem', fontWeight: 600 }}>
+                  District {shouldLockDistrict ? '(Assigned Jurisdiction)' : '*'}
+                </label>
+                {shouldLockDistrict ? (
+                  <div
+                    style={{
+                      width: '100%',
+                      padding: '0.7rem 0.9rem',
+                      borderRadius: '10px',
+                      backgroundColor: 'rgba(255, 255, 255, 0.04)',
+                      border: '1px solid rgba(34, 197, 94, 0.35)',
+                      color: 'var(--color-text)',
+                      fontSize: '0.9rem',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      boxSizing: 'border-box'
+                    }}
+                  >
+                    <span style={{ fontWeight: 700, color: '#4ade80' }}>
+                      🏢 {activeDistrictForTaluks}
+                    </span>
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.25rem', fontSize: '0.72rem', color: 'var(--color-muted)' }}>
+                      <Lock size={12} /> Locked
+                    </span>
+                  </div>
+                ) : (
+                  <select
+                    value={district}
+                    onChange={handleDistrictChange}
+                    style={{
+                      width: '100%',
+                      padding: '0.7rem 0.9rem',
+                      borderRadius: '10px',
+                      backgroundColor: 'var(--color-surface)',
+                      border: '1px solid var(--color-border)',
+                      color: 'var(--color-text)',
+                      fontSize: '0.9rem',
+                      outline: 'none',
+                      cursor: 'pointer'
+                    }}
+                  >
+                    {TN_DISTRICTS.map(d => (
+                      <option key={d} value={d} style={{ backgroundColor: 'var(--color-surface)' }}>{d}</option>
+                    ))}
+                  </select>
+                )}
+                {shouldLockDistrict && (
+                  <span style={{ display: 'block', fontSize: '0.72rem', color: 'var(--color-muted)', marginTop: '0.3rem' }}>
+                    Cooperative staff can only manage machinery within their assigned district.
+                  </span>
+                )}
+              </div>
+
+              <div>
+                <label style={{ display: 'block', fontSize: '0.82rem', color: 'var(--color-text)', marginBottom: '0.35rem', fontWeight: 600 }}>
+                  Taluk ({activeDistrictForTaluks}) *
+                </label>
+                <select
+                  value={taluk}
+                  onChange={handleTalukChange}
+                  style={{
+                    width: '100%',
+                    padding: '0.7rem 0.9rem',
+                    borderRadius: '10px',
+                    backgroundColor: 'var(--color-surface)',
+                    border: '1px solid var(--color-border)',
+                    color: 'var(--color-text)',
+                    fontSize: '0.9rem',
+                    outline: 'none',
+                    cursor: 'pointer'
+                  }}
+                >
+                  {availableTaluks.map(t => (
+                    <option key={t} value={t} style={{ backgroundColor: 'var(--color-surface)' }}>{t} Hub</option>
+                  ))}
+                </select>
+                <span style={{ display: 'block', fontSize: '0.72rem', color: 'var(--color-muted)', marginTop: '0.3rem' }}>
+                  {availableTaluks.length} taluks available in {activeDistrictForTaluks}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+            <div>
+              <label style={{ display: 'block', fontSize: '0.82rem', color: 'var(--color-muted)', marginBottom: '0.35rem', fontWeight: 600 }}>
+                Equipment Name *
+              </label>
+              <input
+                type="text"
+                required
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                style={{
+                  width: '100%',
+                  padding: '0.7rem 0.9rem',
+                  borderRadius: '10px',
+                  backgroundColor: 'transparent',
+                  border: '1px solid var(--color-border)',
+                  color: 'var(--color-text)',
+                  fontSize: '0.9rem',
+                  outline: 'none'
+                }}
+              />
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: '0.82rem', color: 'var(--color-muted)', marginBottom: '0.35rem', fontWeight: 600 }}>
+                Manufacturer *
+              </label>
+              <input
+                type="text"
+                required
+                value={manufacturer}
+                onChange={(e) => setManufacturer(e.target.value)}
+                style={{
+                  width: '100%',
+                  padding: '0.7rem 0.9rem',
+                  borderRadius: '10px',
+                  backgroundColor: 'transparent',
+                  border: '1px solid var(--color-border)',
+                  color: 'var(--color-text)',
+                  fontSize: '0.9rem',
+                  outline: 'none'
+                }}
+              />
+            </div>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+            <div>
+              <label style={{ display: 'block', fontSize: '0.82rem', color: 'var(--color-muted)', marginBottom: '0.35rem', fontWeight: 600 }}>
+                Category *
+              </label>
+              <input
+                type="text"
+                required
+                value={category}
+                onChange={(e) => setCategory(e.target.value)}
+                style={{
+                  width: '100%',
+                  padding: '0.7rem 0.9rem',
+                  borderRadius: '10px',
+                  backgroundColor: 'transparent',
+                  border: '1px solid var(--color-border)',
+                  color: 'var(--color-text)',
+                  fontSize: '0.9rem',
+                  outline: 'none'
+                }}
+              />
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: '0.82rem', color: 'var(--color-muted)', marginBottom: '0.35rem', fontWeight: 600 }}>
+                Daily Rate (₹) *
+              </label>
+              <input
+                type="number"
+                required
+                min="1800"
+                max="3500"
+                value={price}
+                onChange={(e) => setPrice(e.target.value)}
+                style={{
+                  width: '100%',
+                  padding: '0.7rem 0.9rem',
+                  borderRadius: '10px',
+                  backgroundColor: 'transparent',
+                  border: '1px solid var(--color-border)',
+                  color: 'var(--color-text)',
+                  fontSize: '0.9rem',
+                  outline: 'none'
+                }}
+              />
+            </div>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+            <div>
+              <label style={{ display: 'block', fontSize: '0.82rem', color: 'var(--color-muted)', marginBottom: '0.35rem', fontWeight: 600 }}>
+                Condition *
+              </label>
+              <select
+                value={condition}
+                onChange={(e) => setCondition(e.target.value)}
+                style={{
+                  width: '100%',
+                  padding: '0.7rem 0.9rem',
+                  borderRadius: '10px',
+                  backgroundColor: 'transparent',
+                  border: '1px solid var(--color-border)',
+                  color: 'var(--color-text)',
+                  fontSize: '0.9rem',
+                  outline: 'none'
+                }}
+              >
+                <option value="excellent" style={{ backgroundColor: 'var(--color-surface)' }}>Excellent</option>
+                <option value="good" style={{ backgroundColor: 'var(--color-surface)' }}>Good</option>
+                <option value="fair" style={{ backgroundColor: 'var(--color-surface)' }}>Fair</option>
+                <option value="needs_service" style={{ backgroundColor: 'var(--color-surface)' }}>Needs Service</option>
+              </select>
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: '0.82rem', color: 'var(--color-muted)', marginBottom: '0.35rem', fontWeight: 600 }}>
+                Status *
+              </label>
+              <select
+                value={status}
+                onChange={(e) => setStatus(e.target.value)}
+                style={{
+                  width: '100%',
+                  padding: '0.7rem 0.9rem',
+                  borderRadius: '10px',
+                  backgroundColor: 'transparent',
+                  border: '1px solid var(--color-border)',
+                  color: 'var(--color-text)',
+                  fontSize: '0.9rem',
+                  outline: 'none'
+                }}
+              >
+                <option value="Available" style={{ backgroundColor: 'var(--color-surface)' }}>Available</option>
+                <option value="Under Maintenance" style={{ backgroundColor: 'var(--color-surface)' }}>Under Maintenance</option>
+                <option value="Rented" style={{ backgroundColor: 'var(--color-surface)' }}>Rented</option>
+              </select>
+            </div>
+          </div>
+
+          <div>
+            <label style={{ display: 'block', fontSize: '0.82rem', color: 'var(--color-muted)', marginBottom: '0.35rem', fontWeight: 600 }}>
+              Hub Location *
+            </label>
+            <input
+              type="text"
+              required
+              value={location}
+              onChange={(e) => setLocation(e.target.value)}
+              style={{
+                width: '100%',
+                padding: '0.7rem 0.9rem',
+                borderRadius: '10px',
+                backgroundColor: 'transparent',
+                border: '1px solid var(--color-border)',
+                color: 'var(--color-text)',
+                fontSize: '0.9rem',
+                outline: 'none'
+              }}
+            />
+          </div>
+
+          <button type="submit" className="btn-green" style={{ width: '100%', padding: '0.85rem', marginTop: '0.5rem', justifyContent: 'center' }}>
+            <Save size={18} />
+            <span>Save Machinery Updates</span>
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}

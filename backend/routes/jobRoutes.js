@@ -1,0 +1,1300 @@
+// backend/routes/jobRoutes.js
+import express from 'express';
+import { Job, Booking, Equipment, User, Maintenance, Notification, Invoice, AssignmentHistory, logAudit, isDbConnected, localDb } from '../db.js';
+import { authenticateToken, authorizeRoles } from '../middleware/authMiddleware.js';
+
+const router = express.Router();
+
+// GET /api/jobs (Fetch jobs for logged in Operator or manager)
+router.get('/', authenticateToken, async (req, res) => {
+  try {
+    let list = [];
+    if (isDbConnected()) {
+      if (req.user.role === 'Equipment Operator') {
+        list = await Job.find({ operator: req.user.id })
+          .sort({ createdAt: -1 })
+          .populate('booking')
+          .populate('equipment')
+          .populate('farmer', 'name email mobile');
+      } else {
+        list = await Job.find()
+          .sort({ createdAt: -1 })
+          .populate('booking')
+          .populate('equipment')
+          .populate('farmer', 'name email mobile')
+          .populate('operator', 'name email mobile');
+      }
+    } else {
+      list = localDb.read('jobs');
+      const equipment = localDb.read('equipment');
+      const users = localDb.read('users');
+      const bookings = localDb.read('bookings') || [];
+
+      list = list.map(j => ({
+        ...j,
+        booking: bookings.find(b => b._id === j.booking || b.id === j.booking || String(b._id) === String(j.booking)),
+        equipment: equipment.find(e => e._id === j.equipment || e.id === j.equipment),
+        farmer: users.find(u => u._id === j.farmer) || { name: 'Farmer' },
+        operator: users.find(u => u._id === j.operator) || { name: 'Equipment Operator' }
+      }));
+
+      if (req.user.role === 'Equipment Operator') {
+        list = list.filter(j => j.operator._id === req.user.id || j.operator === req.user.id);
+      }
+      list.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+    }
+
+    return res.json({ success: true, count: list.length, data: list });
+  } catch (err) {
+    console.error('Fetch jobs error:', err);
+    return res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
+});
+
+// POST /api/jobs/:id/start (Operator starts job)
+router.post('/:id/start', authenticateToken, authorizeRoles('Operator'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { beforeImage } = req.body;
+    let job;
+    let eq;
+
+    if (isDbConnected()) {
+      job = await Job.findById(id);
+      if (job) {
+        eq = await Equipment.findById(job.equipment);
+      }
+    } else {
+      const jobs = localDb.read('jobs');
+      job = jobs.find(j => j._id === id || j.id === id);
+      if (job) {
+        const equipment = localDb.read('equipment');
+        eq = equipment.find(e => e._id === job.equipment || e.id === job.equipment);
+      }
+    }
+
+    if (!job) {
+      return res.status(404).json({ success: false, message: 'Job not found.' });
+    }
+
+    if (job.status !== 'Assigned') {
+      return res.status(400).json({ success: false, message: `Job has already been ${job.status}` });
+    }
+
+    // Update states
+    job.status = 'Started';
+    job.startTime = new Date();
+    if (beforeImage) {
+      job.beforeImage = beforeImage;
+    }
+
+    if (eq) {
+      eq.status = 'In Use';
+      if (job.unitNum) {
+        const unit = eq.units.find(u => u.unitNum === job.unitNum);
+        if (unit) unit.status = 'In Use';
+      }
+    }
+
+    // Update Booking status
+    let bookingId = job.booking;
+
+    if (isDbConnected()) {
+      await job.save();
+      await eq.save();
+      await Booking.findByIdAndUpdate(bookingId, { status: 'Issued' });
+
+      // Notify Farmer
+      await Notification.create({
+        user: job.farmer,
+        title: 'Work Started',
+        message: `Operator has started work on your booking for ${eq.name}.`
+      });
+    } else {
+      const jobs = localDb.read('jobs');
+      const jIdx = jobs.findIndex(j => j._id === id || j.id === id);
+      jobs[jIdx].status = 'Started';
+      jobs[jIdx].startTime = new Date().toISOString();
+      if (beforeImage) jobs[jIdx].beforeImage = beforeImage;
+      localDb.write('jobs', jobs);
+
+      if (eq) {
+        const equipment = localDb.read('equipment');
+        const eqIdx = equipment.findIndex(e => e._id === eq._id || e.id === eq.id);
+        equipment[eqIdx].status = 'In Use';
+        localDb.write('equipment', equipment);
+      }
+
+      const bookings = localDb.read('bookings');
+      const bIdx = bookings.findIndex(b => b._id === bookingId || b.id === bookingId);
+      if (bIdx !== -1) {
+        bookings[bIdx].status = 'Issued';
+        localDb.write('bookings', bookings);
+      }
+
+      // Notify Farmer
+      const notifications = localDb.read('notifications');
+      notifications.push({
+        _id: 'NTF-' + Date.now(),
+        user: job.farmer,
+        title: 'Work Started',
+        message: `Operator has started work on your booking for ${eq?.name || 'equipment'}.`,
+        read: false,
+        timestamp: new Date().toISOString()
+      });
+      localDb.write('notifications', notifications);
+    }
+
+    await logAudit(req, req.user, 'Work Started', 'Assigned', 'Started', `Operator started job ID ${id}`);
+
+    return res.json({ success: true, message: 'Job started successfully.', data: job });
+  } catch (err) {
+    console.error('Start job error:', err);
+    return res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
+});
+
+// POST /api/jobs/:id/complete (Operator completes job)
+router.post('/:id/complete', authenticateToken, authorizeRoles('Operator'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { 
+      fuelUsed, startTime, endTime, remarks, workCompleted, fieldLocation, 
+      equipmentCondition, damageInfo, photos,
+      paymentCollectionMode, paymentMethod, paymentNotes 
+    } = req.body;
+    let job;
+    let eq;
+
+    if (isDbConnected()) {
+      job = await Job.findById(id);
+      if (job) {
+        eq = await Equipment.findById(job.equipment);
+      }
+    } else {
+      const jobs = localDb.read('jobs');
+      job = jobs.find(j => j._id === id || j.id === id);
+      if (job) {
+        const equipment = localDb.read('equipment');
+        eq = equipment.find(e => e._id === job.equipment || e.id === job.equipment);
+      }
+    }
+
+    if (!job) {
+      return res.status(404).json({ success: false, message: 'Job not found.' });
+    }
+
+    if (job.status !== 'Started') {
+      return res.status(400).json({ success: false, message: 'Job must be started before completing.' });
+    }
+
+    let booking;
+    if (isDbConnected()) {
+      booking = await Booking.findById(job.booking);
+    } else {
+      const bookings = localDb.read('bookings') || [];
+      booking = bookings.find(b => b._id?.toString() === job.booking?.toString() || b.id?.toString() === job.booking?.toString());
+    }
+
+    const durationDays = (booking && booking.durationDays) ? parseInt(booking.durationDays) : 1;
+    const hours = (durationDays || 1) * 9;
+
+    const resolvedStartTime = job.startTime || (booking ? new Date(booking.startDate) : new Date());
+    const resolvedEndTime = new Date(new Date(resolvedStartTime).getTime() + (durationDays || 1) * 24 * 60 * 60 * 1000);
+
+    const fuel = parseFloat(fuelUsed) || 0;
+    const selectedFuelType = req.body.fuelType || booking?.tentativeBill?.fuelType || 'Diesel';
+    const fuelPricePerLiter = selectedFuelType === 'Petrol' ? 102 : 95;
+
+    // Billing calculations
+    const baseAmount = booking?.tentativeBill?.baseAmount || ((eq?.rentalRate || booking?.rentalRate || 1800) * (durationDays || 1));
+    const estimatedFuelCost = booking?.tentativeBill?.estimatedFuelCost || Math.round((durationDays || 1) * 6 * fuelPricePerLiter);
+    const estimatedFuelLiters = booking?.tentativeBill?.estimatedFuelLiters || ((durationDays || 1) * 6);
+    
+    const actualFuelLiters = fuel;
+    const actualFuelCost = Math.round(actualFuelLiters * fuelPricePerLiter);
+    const fuelAdjustment = actualFuelCost - estimatedFuelCost; // Difference (+/-)
+    
+    const finalSubtotal = baseAmount + actualFuelCost;
+    const finalTax = Math.round(finalSubtotal * 0.18);
+    const finalTotal = finalSubtotal + finalTax + (booking?.penalty || 0);
+
+    const finalBill = {
+      baseAmount,
+      estimatedFuelLiters,
+      estimatedFuelCost,
+      actualFuelLiters,
+      fuelType: selectedFuelType,
+      fuelPricePerLiter,
+      actualFuelCost,
+      fuelAdjustment,
+      tax: finalTax,
+      totalAmount: finalTotal,
+      isFinalBilled: true,
+      billedAt: new Date().toISOString()
+    };
+
+    // Update job details
+    job.status = 'Completed';
+    job.endTime = resolvedEndTime;
+    job.startTime = resolvedStartTime;
+    job.fuelUsed = fuel;
+    job.fuelType = selectedFuelType;
+    job.workingHours = hours;
+    job.remarks = remarks || '';
+    job.workCompleted = workCompleted || '';
+    job.fieldLocation = fieldLocation || '';
+    job.equipmentCondition = equipmentCondition || 'Good';
+    job.damageInfo = damageInfo || '';
+    if (photos && photos.length > 0) {
+      job.photos = photos;
+    }
+
+    let bookingId = job.booking;
+    let oldEquipmentStatus = eq ? eq.status : 'In Use';
+    let newEquipmentStatus = 'Available';
+
+    const isCollectedOnSpot = paymentCollectionMode === 'COLLECTED_ON_SPOT';
+    const completionDate = new Date();
+    const dueDate = new Date(completionDate.getTime() + 7 * 24 * 60 * 60 * 1000); // 1 week (7 days) grace period to pay
+
+    // Update equipment usage hours
+    if (eq) {
+      const curCycle = typeof eq.currentCycleHours === 'number' && !isNaN(eq.currentCycleHours) ? eq.currentCycleHours : 0;
+      const totalHours = typeof eq.totalUsageHours === 'number' && !isNaN(eq.totalUsageHours) ? eq.totalUsageHours : 0;
+      
+      eq.currentCycleHours = Math.round((curCycle + hours) * 10) / 10;
+      eq.totalUsageHours = Math.round((totalHours + hours) * 10) / 10;
+      
+      // Update sub-unit work hours
+      if (job.unitNum && Array.isArray(eq.units)) {
+        const unit = eq.units.find(u => u.unitNum === job.unitNum);
+        if (unit) {
+          const uHours = typeof unit.hours === 'number' && !isNaN(unit.hours) ? unit.hours : 0;
+          unit.hours = Math.round((uHours + hours) * 10) / 10;
+        }
+      }
+
+      eq.status = 'Available';
+      if (job.unitNum && Array.isArray(eq.units)) {
+        const unit = eq.units.find(u => u.unitNum === job.unitNum);
+        if (unit) unit.status = 'Available';
+      }
+    }
+
+    if (isDbConnected()) {
+      await job.save();
+      if (eq) {
+        await eq.save();
+        
+        // If maintenance is required, create a Maintenance record and notify
+        if (newEquipmentStatus === 'Maintenance Required') {
+          await Maintenance.create({
+            equipment: eq._id,
+            description: 'Automated 360-hour preventative maintenance trigger',
+            cost: 0,
+            status: 'Pending',
+            previousUsageHours: eq.totalUsageHours,
+            maintenanceReason: '360 Hour Threshold Reached'
+          });
+
+          // Notify Specialists
+          const specialists = await User.find({ role: 'Equipmaintance' });
+          for (const sp of specialists) {
+            await Notification.create({
+              user: sp._id,
+              title: 'Preventative Maintenance Required',
+              message: `Equipment ${eq.name} (${eq.regNumber}) has reached ${eq.currentCycleHours}/360 hours. Maintenance task has been auto-generated.`
+            });
+          }
+        }
+      }
+
+      // Update booking status, final bill, and payment due window
+      if (booking) {
+        booking.status = 'Returned';
+        booking.finalBill = finalBill;
+        booking.isFinalBilled = true;
+        booking.totalAmount = finalTotal;
+        booking.dueDate = dueDate;
+        booking.paymentStatus = isCollectedOnSpot ? 'Paid' : 'Unpaid';
+        booking.paymentCollectionMode = isCollectedOnSpot ? 'Collected by Operator' : 'Pending Office Payment';
+        booking.collectedBy = isCollectedOnSpot ? (req.user.name || 'Equipment Operator') : null;
+        booking.collectedByRole = isCollectedOnSpot ? 'Equipment Operator' : null;
+        booking.collectedAt = isCollectedOnSpot ? completionDate : null;
+        booking.paidAt = isCollectedOnSpot ? completionDate : null;
+        booking.paidByStaff = isCollectedOnSpot ? `${req.user.name || 'Operator'} (Operator)` : null;
+        booking.paymentMethod = isCollectedOnSpot ? (paymentMethod || 'Cash') : null;
+        booking.paymentNotes = paymentNotes || '';
+        await booking.save();
+      }
+
+      // Update Invoice for final bill and due date
+      const inv = await Invoice.findOne({ booking: bookingId });
+      if (inv) {
+        inv.billingStatus = 'Final Billed';
+        inv.isTentative = false;
+        inv.actualFuelLiters = actualFuelLiters;
+        inv.fuelType = selectedFuelType;
+        inv.fuelPricePerLiter = fuelPricePerLiter;
+        inv.actualFuelCost = actualFuelCost;
+        inv.fuelAdjustment = fuelAdjustment;
+        inv.tax = finalTax;
+        inv.totalAmount = finalTotal;
+        inv.finalAmount = finalTotal;
+        inv.dueDate = dueDate;
+        inv.paymentStatus = isCollectedOnSpot ? 'Paid' : 'Unpaid';
+        inv.paymentCollectionMode = isCollectedOnSpot ? 'Collected by Operator' : 'Pending Office Payment';
+        inv.collectedBy = isCollectedOnSpot ? (req.user.name || 'Equipment Operator') : null;
+        inv.collectedByRole = isCollectedOnSpot ? 'Equipment Operator' : null;
+        inv.collectedAt = isCollectedOnSpot ? completionDate : null;
+        inv.paidAt = isCollectedOnSpot ? completionDate : null;
+        inv.paidByStaff = isCollectedOnSpot ? `${req.user.name || 'Operator'} (Operator)` : null;
+        inv.paymentMethod = isCollectedOnSpot ? (paymentMethod || 'Cash') : null;
+        inv.paymentNotes = paymentNotes || '';
+        await inv.save();
+      }
+
+      // Notify Farmer
+      await Notification.create({
+        user: job.farmer,
+        title: isCollectedOnSpot ? 'Work Completed & Payment Collected' : 'Work Completed & Final Bill Generated',
+        message: isCollectedOnSpot
+          ? `Your equipment rental order has been completed. Payment of ₹${finalTotal} was successfully collected on-field by Operator ${req.user.name || 'Operator'} via ${paymentMethod || 'Cash'}. Receipt confirmed.`
+          : `Your equipment rental order has been completed. Final Bill: ₹${finalTotal}. The farmer did not pay on spot. Please visit your Cooperative Hub within 7 days (by ${dueDate.toLocaleDateString()}) to pay the cooperative staff.`
+      });
+
+      // Notify Cooperative Staff
+      const staffUsers = await User.find({ role: 'Staff' });
+      for (const st of staffUsers) {
+        await Notification.create({
+          user: st._id,
+          title: isCollectedOnSpot ? 'Spot Payment Collected by Operator' : 'Pending Office Payment (1-Week Window)',
+          message: isCollectedOnSpot
+            ? `Operator ${req.user.name || 'Operator'} completed job #${id} and collected ₹${finalTotal} (${paymentMethod || 'Cash'}) on field from farmer. Ready for hub deposit.`
+            : `Farmer for job #${id} (${booking?.farmer?.name || 'Farmer'}) will pay ₹${finalTotal} at the Cooperative Office within 1 week (due ${dueDate.toLocaleDateString()}).`
+        });
+      }
+    } else {
+      const jobs = localDb.read('jobs');
+      const jIdx = jobs.findIndex(j => j._id === id || j.id === id);
+      jobs[jIdx] = {
+        ...jobs[jIdx],
+        status: 'Completed',
+        endTime: resolvedEndTime.toISOString(),
+        startTime: resolvedStartTime.toISOString(),
+        fuelUsed: fuel,
+        fuelType: selectedFuelType,
+        workingHours: hours,
+        remarks: remarks || '',
+        workCompleted: workCompleted || '',
+        fieldLocation: fieldLocation || '',
+        equipmentCondition: equipmentCondition || 'Good',
+        damageInfo: damageInfo || '',
+        photos: photos || []
+      };
+      localDb.write('jobs', jobs);
+
+      if (eq) {
+        const equipmentList = localDb.read('equipment');
+        const eqIdx = equipmentList.findIndex(e => e._id === eq._id || e.id === eq.id);
+        if (eqIdx !== -1) {
+          equipmentList[eqIdx] = eq;
+          localDb.write('equipment', equipmentList);
+        }
+
+        if (newEquipmentStatus === 'Maintenance Required') {
+          const maintenanceList = localDb.read('maintenance') || [];
+          maintenanceList.push({
+            _id: 'MNT-' + Date.now(),
+            equipment: eq._id || eq.id,
+            serviceDate: new Date().toISOString(),
+            description: 'Automated 360-hour preventative maintenance trigger',
+            cost: 0,
+            status: 'Pending',
+            previousUsageHours: eq.totalUsageHours,
+            maintenanceReason: '360 Hour Threshold Reached',
+            createdAt: new Date().toISOString()
+          });
+          localDb.write('maintenance', maintenanceList);
+
+          const users = localDb.read('users');
+          const specialists = users.filter(u => u.role === 'Equipmaintance');
+          const notifications = localDb.read('notifications') || [];
+          for (const sp of specialists) {
+            notifications.push({
+              _id: 'NTF-M-' + Date.now() + Math.random().toString(36).substr(2, 4),
+              user: sp._id || sp.id,
+              title: 'Preventative Maintenance Required',
+              message: `Equipment ${eq.name} (${eq.regNumber}) has reached ${eq.currentCycleHours}/360 hours. Maintenance task has been auto-generated.`,
+              read: false,
+              timestamp: new Date().toISOString()
+            });
+          }
+          localDb.write('notifications', notifications);
+        }
+      }
+
+      const bookings = localDb.read('bookings');
+      const bIdx = bookings.findIndex(b => b._id === bookingId || b.id === bookingId || b._id?.toString() === bookingId?.toString());
+      if (bIdx !== -1) {
+        bookings[bIdx].status = 'Returned';
+        bookings[bIdx].finalBill = finalBill;
+        bookings[bIdx].isFinalBilled = true;
+        bookings[bIdx].totalAmount = finalTotal;
+        bookings[bIdx].dueDate = dueDate.toISOString();
+        bookings[bIdx].paymentStatus = isCollectedOnSpot ? 'Paid' : 'Unpaid';
+        bookings[bIdx].paymentCollectionMode = isCollectedOnSpot ? 'Collected by Operator' : 'Pending Office Payment';
+        bookings[bIdx].collectedBy = isCollectedOnSpot ? (req.user.name || 'Equipment Operator') : null;
+        bookings[bIdx].collectedByRole = isCollectedOnSpot ? 'Equipment Operator' : null;
+        bookings[bIdx].collectedAt = isCollectedOnSpot ? completionDate.toISOString() : null;
+        bookings[bIdx].paidAt = isCollectedOnSpot ? completionDate.toISOString() : null;
+        bookings[bIdx].paidByStaff = isCollectedOnSpot ? `${req.user.name || 'Operator'} (Operator)` : null;
+        bookings[bIdx].paymentMethod = isCollectedOnSpot ? (paymentMethod || 'Cash') : null;
+        bookings[bIdx].paymentNotes = paymentNotes || '';
+        localDb.write('bookings', bookings);
+      }
+
+      const invoices = localDb.read('invoices');
+      const invIdx = invoices.findIndex(i => i.booking === bookingId || i.booking?.toString() === bookingId?.toString());
+      if (invIdx !== -1) {
+        invoices[invIdx].billingStatus = 'Final Billed';
+        invoices[invIdx].isTentative = false;
+        invoices[invIdx].actualFuelLiters = actualFuelLiters;
+        invoices[invIdx].fuelType = selectedFuelType;
+        invoices[invIdx].fuelPricePerLiter = fuelPricePerLiter;
+        invoices[invIdx].actualFuelCost = actualFuelCost;
+        invoices[invIdx].fuelAdjustment = fuelAdjustment;
+        invoices[invIdx].tax = finalTax;
+        invoices[invIdx].totalAmount = finalTotal;
+        invoices[invIdx].finalAmount = finalTotal;
+        invoices[invIdx].dueDate = dueDate.toISOString();
+        invoices[invIdx].paymentStatus = isCollectedOnSpot ? 'Paid' : 'Unpaid';
+        invoices[invIdx].paymentCollectionMode = isCollectedOnSpot ? 'Collected by Operator' : 'Pending Office Payment';
+        invoices[invIdx].collectedBy = isCollectedOnSpot ? (req.user.name || 'Equipment Operator') : null;
+        invoices[invIdx].collectedByRole = isCollectedOnSpot ? 'Equipment Operator' : null;
+        invoices[invIdx].collectedAt = isCollectedOnSpot ? completionDate.toISOString() : null;
+        invoices[invIdx].paidAt = isCollectedOnSpot ? completionDate.toISOString() : null;
+        invoices[invIdx].paidByStaff = isCollectedOnSpot ? `${req.user.name || 'Operator'} (Operator)` : null;
+        invoices[invIdx].paymentMethod = isCollectedOnSpot ? (paymentMethod || 'Cash') : null;
+        invoices[invIdx].paymentNotes = paymentNotes || '';
+        localDb.write('invoices', invoices);
+      }
+
+      // Notify Farmer
+      const notifications = localDb.read('notifications') || [];
+      notifications.push({
+        _id: 'NTF-' + Date.now(),
+        user: job.farmer,
+        title: isCollectedOnSpot ? 'Work Completed & Payment Collected' : 'Work Completed & Final Bill Generated',
+        message: isCollectedOnSpot
+          ? `Your equipment rental order has been completed. Payment of ₹${finalTotal} was successfully collected on-field by Operator ${req.user.name || 'Operator'} via ${paymentMethod || 'Cash'}. Receipt confirmed.`
+          : `Your equipment rental order has been completed. Final Bill: ₹${finalTotal} (Fuel adjustment: ${fuelAdjustment >= 0 ? '+' : ''}₹${fuelAdjustment}). The farmer did not pay on spot. Please visit your Cooperative Hub within 7 days (by ${dueDate.toLocaleDateString()}) to pay cooperative staff.`,
+        read: false,
+        timestamp: new Date().toISOString()
+      });
+
+      // Notify Staff
+      const users = localDb.read('users') || [];
+      const staffList = users.filter(u => u.role === 'Staff');
+      for (const st of staffList) {
+        notifications.push({
+          _id: 'NTF-S-' + Date.now() + Math.random().toString(36).substr(2, 4),
+          user: st._id || st.id,
+          title: isCollectedOnSpot ? 'Spot Payment Collected by Operator' : 'Pending Office Payment (1-Week Window)',
+          message: isCollectedOnSpot
+            ? `Operator ${req.user.name || 'Operator'} collected ₹${finalTotal} (${paymentMethod || 'Cash'}) on field from farmer for job #${id}. Ready for hub deposit.`
+            : `Farmer for completed job #${id} will pay ₹${finalTotal} at the Cooperative Office within 1 week (due ${dueDate.toLocaleDateString()}).`,
+          read: false,
+          timestamp: new Date().toISOString()
+        });
+      }
+      localDb.write('notifications', notifications);
+    }
+
+    // Audit logs
+    await logAudit(req, req.user, 'Operator submitted work completion report', 'Started', 'Completed', `Operator completed job ID ${id}. Working hours: ${hours}. Payment: ${paymentCollectionMode || 'Pending Office Payment'}`);
+    if (newEquipmentStatus === 'Maintenance Required') {
+      await logAudit(req, null, 'Equipment reached 360 usage hours', String(hours), String(eq.currentCycleHours), `Equipment ${eq.name} reached 360 hours threshold.`);
+      await logAudit(req, null, 'Equipment automatically marked Maintenance Required', oldEquipmentStatus, 'Maintenance Required', `Equipment ${eq.name} status updated automatically.`);
+      await logAudit(req, null, 'Maintenance task created', '', 'Pending', `Automated maintenance task created for ${eq.name}`);
+    }
+
+    return res.json({ 
+      success: true, 
+      message: isCollectedOnSpot 
+        ? `Job completed and payment of ₹${finalTotal} collected successfully on spot!` 
+        : `Job completed successfully! 7-day office payment window issued (due ${dueDate.toLocaleDateString()}).`, 
+      data: job 
+    });
+  } catch (err) {
+    console.error('Complete job error:', err);
+    return res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
+});
+
+// POST /api/jobs/:id/collect-payment (Operator collects payment on spot for already-completed job)
+router.post('/:id/collect-payment', authenticateToken, authorizeRoles('Operator'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { paymentMethod, paymentNotes } = req.body;
+    let job;
+
+    if (isDbConnected()) {
+      job = await Job.findById(id).populate('booking');
+    } else {
+      const jobs = localDb.read('jobs');
+      job = jobs.find(j => j._id === id || j.id === id);
+    }
+
+    if (!job) {
+      return res.status(404).json({ success: false, message: 'Job not found.' });
+    }
+
+    const bookingId = job.booking?._id || job.booking;
+    const now = new Date();
+    const collectorName = req.user.name || 'Equipment Operator';
+    const method = paymentMethod || 'Cash';
+    let collectedAmount = 0;
+
+    if (isDbConnected()) {
+      const booking = await Booking.findById(bookingId);
+      if (booking) {
+        collectedAmount = booking.totalAmount || booking.finalBill?.totalAmount || 0;
+        booking.paymentStatus = 'Paid';
+        booking.paidAt = now;
+        booking.paidByStaff = `${collectorName} (Operator)`;
+        booking.paymentMethod = method;
+        booking.paymentCollectionMode = 'Collected by Operator';
+        booking.collectedBy = collectorName;
+        booking.collectedByRole = 'Equipment Operator';
+        booking.collectedAt = now;
+        booking.paymentNotes = paymentNotes || '';
+        await booking.save();
+      }
+
+      const inv = await Invoice.findOne({ booking: bookingId });
+      if (inv) {
+        if (!collectedAmount) collectedAmount = inv.totalAmount || 0;
+        inv.paymentStatus = 'Paid';
+        inv.paidAt = now;
+        inv.paidByStaff = `${collectorName} (Operator)`;
+        inv.paymentMethod = method;
+        inv.paymentCollectionMode = 'Collected by Operator';
+        inv.collectedBy = collectorName;
+        inv.collectedByRole = 'Equipment Operator';
+        inv.collectedAt = now;
+        inv.paymentNotes = paymentNotes || '';
+        await inv.save();
+      }
+
+      // Notify Farmer
+      await Notification.create({
+        user: job.farmer,
+        title: 'Payment Received by Operator',
+        message: `Payment of ₹${collectedAmount} was collected by Operator ${collectorName} via ${method}. Thank you!`
+      });
+
+      // Notify Staff
+      const staffUsers = await User.find({ role: 'Staff' });
+      for (const st of staffUsers) {
+        await Notification.create({
+          user: st._id,
+          title: 'Spot Payment Collected by Operator',
+          message: `Operator ${collectorName} collected ₹${collectedAmount} (${method}) for completed booking #${bookingId}. Ready for hub deposit.`
+        });
+      }
+    } else {
+      const bookings = localDb.read('bookings');
+      const bIdx = bookings.findIndex(b => b._id === bookingId || b.id === bookingId || b._id?.toString() === bookingId?.toString());
+      if (bIdx !== -1) {
+        collectedAmount = bookings[bIdx].totalAmount || bookings[bIdx].finalBill?.totalAmount || 0;
+        bookings[bIdx].paymentStatus = 'Paid';
+        bookings[bIdx].paidAt = now.toISOString();
+        bookings[bIdx].paidByStaff = `${collectorName} (Operator)`;
+        bookings[bIdx].paymentMethod = method;
+        bookings[bIdx].paymentCollectionMode = 'Collected by Operator';
+        bookings[bIdx].collectedBy = collectorName;
+        bookings[bIdx].collectedByRole = 'Equipment Operator';
+        bookings[bIdx].collectedAt = now.toISOString();
+        bookings[bIdx].paymentNotes = paymentNotes || '';
+        localDb.write('bookings', bookings);
+      }
+
+      const invoices = localDb.read('invoices');
+      const invIdx = invoices.findIndex(i => i.booking === bookingId || i.booking?.toString() === bookingId?.toString());
+      if (invIdx !== -1) {
+        if (!collectedAmount) collectedAmount = invoices[invIdx].totalAmount || 0;
+        invoices[invIdx].paymentStatus = 'Paid';
+        invoices[invIdx].paidAt = now.toISOString();
+        invoices[invIdx].paidByStaff = `${collectorName} (Operator)`;
+        invoices[invIdx].paymentMethod = method;
+        invoices[invIdx].paymentCollectionMode = 'Collected by Operator';
+        invoices[invIdx].collectedBy = collectorName;
+        invoices[invIdx].collectedByRole = 'Equipment Operator';
+        invoices[invIdx].collectedAt = now.toISOString();
+        invoices[invIdx].paymentNotes = paymentNotes || '';
+        localDb.write('invoices', invoices);
+      }
+    }
+
+    await logAudit(req, req.user, 'Spot Payment Collected', 'Unpaid', 'Paid', `Operator ${collectorName} collected payment of ₹${collectedAmount} via ${method}`);
+
+    return res.json({ 
+      success: true, 
+      message: `Payment of ₹${collectedAmount} collected successfully via ${method}! Cooperative staff has been notified for hub deposit.` 
+    });
+  } catch (err) {
+    console.error('Collect payment error:', err);
+    return res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
+});
+
+// GET /api/jobs/cancellation-requests (Staff views cancellation requests)
+router.get('/cancellation-requests', authenticateToken, authorizeRoles('Admin', 'Staff', 'Cooperative Staff'), async (req, res) => {
+  try {
+    let requests = [];
+    if (isDbConnected()) {
+      requests = await Job.find({
+        $or: [
+          { status: 'CANCELLATION_REQUESTED' },
+          { cancellationRequested: true }
+        ],
+        cancellationDecision: { $nin: ['Approved', 'Rejected', 'APPROVED', 'REJECTED'] }
+      })
+      .populate('equipment')
+      .populate('farmer', 'name email mobile')
+      .populate('operator', 'name email mobile operatorId');
+    } else {
+      const jobs = localDb.read('jobs') || [];
+      const equipment = localDb.read('equipment') || [];
+      const users = localDb.read('users') || [];
+
+      requests = jobs.filter(j => 
+        (j.status === 'CANCELLATION_REQUESTED' || j.cancellationRequested === true) &&
+        !['Approved', 'Rejected', 'APPROVED', 'REJECTED'].includes(j.cancellationDecision)
+      )
+        .map(j => ({
+          ...j,
+          equipment: equipment.find(e => e._id === j.equipment || e.id === j.equipment),
+          farmer: users.find(u => u._id === j.farmer || u.id === j.farmer) || { name: 'Farmer' },
+          operator: users.find(u => u._id === j.operator || u.id === j.operator) || { name: 'Operator' }
+        }));
+    }
+    return res.json({ success: true, count: requests.length, data: requests });
+  } catch (err) {
+    console.error('Fetch cancellation requests error:', err);
+    return res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
+});
+
+// GET /api/jobs/operator-stats (Staff views operator performance & cancellation statistics)
+router.get('/operator-stats', authenticateToken, authorizeRoles('Admin', 'Staff', 'Cooperative Staff', 'Officer'), async (req, res) => {
+  try {
+    let operators = [];
+    let jobs = [];
+
+    const isStaff = req.user && (req.user.role === 'Staff' || req.user.role === 'Cooperative Staff');
+    let staffDistrict = req.user?.district || req.query.district || '';
+
+    if (isStaff && !staffDistrict) {
+      if (isDbConnected()) {
+        const dbUser = await User.findById(req.user.id || req.user._id);
+        if (dbUser) staffDistrict = dbUser.district || '';
+      } else {
+        const users = localDb.read('users') || [];
+        const dbUser = users.find(u => String(u._id || u.id) === String(req.user.id));
+        if (dbUser) staffDistrict = dbUser.district || '';
+      }
+    }
+
+    if (isDbConnected()) {
+      let query = { role: { $in: ['Equipment Operator', 'Operator'] } };
+      if (staffDistrict && staffDistrict !== 'ALL') {
+        query.district = new RegExp(`^${staffDistrict.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&')}$`, 'i');
+      }
+      operators = await User.find(query).lean();
+      jobs = await Job.find().lean();
+    } else {
+      const users = localDb.read('users') || [];
+      let allOps = users.filter(u => u.role === 'Equipment Operator' || u.role === 'Operator');
+      if (staffDistrict && staffDistrict !== 'ALL') {
+        const dNorm = staffDistrict.toLowerCase();
+        operators = allOps.filter(u => u.district && u.district.toLowerCase() === dNorm);
+      } else {
+        operators = allOps;
+      }
+      jobs = localDb.read('jobs') || [];
+    }
+
+    const stats = operators.map(op => {
+      const opIdStr = (op._id || op.id)?.toString();
+      const opJobs = jobs.filter(j => {
+        const jOpStr = (j.operator?._id || j.operator)?.toString();
+        return jOpStr === opIdStr;
+      });
+
+      const totalJobs = opJobs.length;
+      const completed = opJobs.filter(j => j.status === 'Completed').length;
+      const cancellationRequests = opJobs.filter(j => j.cancellationRequested || j.status === 'CANCELLATION_REQUESTED' || j.cancellationDecision).length;
+      const approved = opJobs.filter(j => j.cancellationDecision === 'Approved').length;
+      const rejected = opJobs.filter(j => j.cancellationDecision === 'Rejected').length;
+
+      return {
+        operatorId: op.operatorId || op.id || 'OP-' + String(op._id).slice(-4),
+        name: op.name || 'Operator',
+        district: op.district || '',
+        taluk: op.taluk || (op.cooperativeHub ? op.cooperativeHub.replace(/ hub$/i, '').trim() : ''),
+        mobile: op.mobile || '',
+        status: op.status || 'Active',
+        totalJobs,
+        completed,
+        cancellationRequests,
+        approved,
+        rejected
+      };
+    });
+
+    return res.json({ success: true, count: stats.length, data: stats });
+  } catch (err) {
+    console.error('Fetch operator stats error:', err);
+    return res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
+});
+
+// POST /api/jobs/:id/request-cancellation (Operator requests cancellation with reason and explanation)
+router.post('/:id/request-cancellation', authenticateToken, authorizeRoles('Operator', 'Equipment Operator'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reason, explanation } = req.body;
+
+    if (!reason || !explanation || !explanation.trim()) {
+      return res.status(400).json({ success: false, message: 'Cancellation reason and detailed explanation are mandatory.' });
+    }
+
+    let job;
+    if (isDbConnected()) {
+      job = await Job.findById(id);
+    } else {
+      const jobs = localDb.read('jobs') || [];
+      job = jobs.find(j => j._id === id || j.id === id);
+    }
+
+    if (!job) {
+      return res.status(404).json({ success: false, message: 'Job not found.' });
+    }
+
+    const jobOpId = (job.operator?._id || job.operator)?.toString();
+    if (jobOpId !== req.user.id.toString()) {
+      return res.status(403).json({ success: false, message: 'Unauthorized: You can only request cancellation for your own assigned jobs.' });
+    }
+
+    if (job.cancellationRequested) {
+      return res.status(400).json({ success: false, message: 'Cancellation request has already been submitted for this job.' });
+    }
+
+    job.cancellationRequested = true;
+    job.cancellationReason = reason;
+    job.cancellationNote = explanation;
+    job.cancellationRequestedAt = new Date();
+    job.status = 'CANCELLATION_REQUESTED';
+
+    if (isDbConnected()) {
+      await job.save();
+
+      // Notify Staff
+      const staffUsers = await User.find({ role: { $in: ['Cooperative Staff', 'Admin', 'Manager'] } });
+      for (const st of staffUsers) {
+        await Notification.create({
+          user: st._id,
+          title: '⚠️ Operator Cancellation Request',
+          message: `Operator requested cancellation for Job #${job.jobId || job._id}. Reason: ${reason}`
+        });
+      }
+    } else {
+      const jobs = localDb.read('jobs') || [];
+      const idx = jobs.findIndex(j => j._id === id || j.id === id);
+      if (idx !== -1) {
+        jobs[idx] = {
+          ...jobs[idx],
+          cancellationRequested: true,
+          cancellationReason: reason,
+          cancellationNote: explanation,
+          cancellationRequestedAt: new Date().toISOString(),
+          status: 'CANCELLATION_REQUESTED'
+        };
+        localDb.write('jobs', jobs);
+      }
+    }
+
+    await logAudit(req, req.user, 'Operator Requested Cancellation', job.status, 'CANCELLATION_REQUESTED', `Reason: ${reason} - ${explanation}`);
+
+    return res.json({ success: true, message: 'Cancellation request submitted. Awaiting Cooperative Staff review.', data: job });
+  } catch (err) {
+    console.error('Request cancellation error:', err);
+    return res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
+});
+
+// POST /api/jobs/:id/approve-cancellation (Staff approves cancellation)
+router.post('/:id/approve-cancellation', authenticateToken, authorizeRoles('Admin', 'Staff', 'Cooperative Staff'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    let job;
+
+    if (isDbConnected()) {
+      job = await Job.findById(id).populate('equipment').populate('booking');
+    } else {
+      const jobs = localDb.read('jobs') || [];
+      job = jobs.find(j => j._id === id || j.id === id);
+    }
+
+    if (!job) {
+      return res.status(404).json({ success: false, message: 'Job not found.' });
+    }
+
+    const oldOperatorId = (job.operator?._id || job.operator)?.toString();
+    const oldOperatorIdRaw = job.operator;
+
+    // Determine target location and dates for reassignment
+    let targetTaluk = job.taluk || job.equipment?.taluk || '';
+    let targetDistrict = job.district || job.equipment?.district || req.user.district || '';
+
+    let startDate = job.assignedDate || job.createdAt || new Date();
+    let durationDays = 1;
+    if (job.booking) {
+      startDate = job.booking.startDate || startDate;
+      durationDays = job.booking.durationDays || 1;
+    }
+
+    const start = new Date(startDate);
+    const end = new Date(start.getTime() + durationDays * 24 * 60 * 60 * 1000);
+
+    let replacementOperator = null;
+
+    if (isDbConnected()) {
+      // Find active jobs that overlap with start -> end window
+      const activeJobs = await Job.find({
+        _id: { $ne: job._id },
+        status: { $in: ['ASSIGNED', 'ACCEPTED', 'PRECHECK', 'READY', 'IN_PROGRESS', 'PAUSED', 'Assigned', 'Started', 'CANCELLATION_REQUESTED'] }
+      });
+
+      const busyOperatorIds = new Set(activeJobs.map(j => (j.operator?._id || j.operator)?.toString()).filter(Boolean));
+
+      // Build location query for candidate operators in the same taluk
+      let locationFilter = {};
+      if (targetTaluk) {
+        const talukRegex = new RegExp(targetTaluk.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&'), 'i');
+        locationFilter = {
+          $or: [
+            { taluk: talukRegex },
+            { cooperativeHub: talukRegex }
+          ]
+        };
+      } else if (targetDistrict) {
+        const distRegex = new RegExp(`^${targetDistrict.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&')}$`, 'i');
+        locationFilter = { district: distRegex };
+      }
+
+      // Find operators in the target location
+      let candidateOperators = await User.find({
+        role: { $in: ['Equipment Operator', 'Operator'] },
+        ...locationFilter
+      });
+
+      // Filter out original cancelling operator and operators busy on that day
+      let eligibleOperators = candidateOperators.filter(op => {
+        const opId = op._id.toString();
+        if (opId === oldOperatorId) return false;
+        return !busyOperatorIds.has(opId);
+      });
+
+      // Fallback to district level if no free operator in specific taluk
+      if (eligibleOperators.length === 0 && targetDistrict && targetTaluk) {
+        const districtOps = await User.find({
+          role: { $in: ['Equipment Operator', 'Operator'] },
+          district: new RegExp(`^${targetDistrict.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&')}$`, 'i')
+        });
+        eligibleOperators = districtOps.filter(op => {
+          const opId = op._id.toString();
+          if (opId === oldOperatorId) return false;
+          return !busyOperatorIds.has(opId);
+        });
+      }
+
+      if (eligibleOperators.length > 0) {
+        replacementOperator = eligibleOperators[0];
+      }
+    } else {
+      // Local Database logic
+      const jobs = localDb.read('jobs') || [];
+      const users = localDb.read('users') || [];
+      const equipments = localDb.read('equipment') || [];
+
+      const eq = equipments.find(e => (e._id || e.id) === (job.equipment?._id || job.equipment));
+      if (!targetTaluk && eq) targetTaluk = eq.taluk || '';
+      if (!targetDistrict && eq) targetDistrict = eq.district || '';
+
+      const activeJobs = jobs.filter(j => 
+        (j._id !== id && j.id !== id) &&
+        ['ASSIGNED', 'ACCEPTED', 'PRECHECK', 'READY', 'IN_PROGRESS', 'PAUSED', 'Assigned', 'Started', 'CANCELLATION_REQUESTED'].includes(j.status)
+      );
+
+      const busyOperatorIds = new Set(activeJobs.map(j => (j.operator?._id || j.operator)?.toString()).filter(Boolean));
+
+      let allOps = users.filter(u => u.role === 'Equipment Operator' || u.role === 'Operator');
+      let candidateOperators = [];
+
+      if (targetTaluk) {
+        const tNorm = targetTaluk.toLowerCase();
+        candidateOperators = allOps.filter(u => 
+          (u.taluk && u.taluk.toLowerCase() === tNorm) ||
+          (u.cooperativeHub && u.cooperativeHub.toLowerCase().includes(tNorm))
+        );
+      } else if (targetDistrict) {
+        const dNorm = targetDistrict.toLowerCase();
+        candidateOperators = allOps.filter(u => u.district && u.district.toLowerCase() === dNorm);
+      }
+
+      let eligibleOperators = candidateOperators.filter(op => {
+        const opId = (op._id || op.id)?.toString();
+        if (opId === oldOperatorId) return false;
+        return !busyOperatorIds.has(opId);
+      });
+
+      if (eligibleOperators.length === 0 && targetDistrict && targetTaluk) {
+        const dNorm = targetDistrict.toLowerCase();
+        const districtOps = allOps.filter(u => u.district && u.district.toLowerCase() === dNorm);
+        eligibleOperators = districtOps.filter(op => {
+          const opId = (op._id || op.id)?.toString();
+          if (opId === oldOperatorId) return false;
+          return !busyOperatorIds.has(opId);
+        });
+      }
+
+      if (eligibleOperators.length > 0) {
+        replacementOperator = eligibleOperators[0];
+      }
+    }
+
+    // Update job state
+    job.cancellationDecision = 'Approved';
+    job.cancellationDecisionBy = req.user.id;
+    job.cancellationDecisionAt = new Date();
+    job.cancellationRequested = false;
+
+    let responseMsg = '';
+
+    if (replacementOperator) {
+      const newOpId = replacementOperator._id || replacementOperator.id;
+      job.operator = newOpId;
+      job.status = 'ASSIGNED';
+      responseMsg = `Cancellation approved! Job automatically reassigned to ${replacementOperator.name || 'new operator'} (${replacementOperator.taluk || targetTaluk} Taluk) who is free on the requested date.`;
+    } else {
+      job.operator = null;
+      job.status = 'MANUAL_REASSIGNMENT_REQUIRED';
+      responseMsg = `Cancellation approved. No available operator was free in ${targetTaluk || 'the taluk'} on the requested date, so manual reassignment is required.`;
+    }
+
+    if (isDbConnected()) {
+      await job.save();
+
+      // Log assignment history
+      await AssignmentHistory.create({
+        jobId: job._id,
+        operatorId: oldOperatorIdRaw,
+        assignmentType: 'AUTOMATIC_ROTATION',
+        assignedBy: 'SYSTEM',
+        unassignedAt: new Date(),
+        reason: `Cancellation approved by Staff. ${replacementOperator ? `Auto-reassigned to ${replacementOperator.name}.` : 'No free operator in taluk.'}`
+      });
+
+      // Notifications
+      if (oldOperatorIdRaw) {
+        await Notification.create({
+          user: oldOperatorIdRaw,
+          title: 'Cancellation Approved',
+          message: `Your cancellation request for Job #${job.jobId || job._id} has been approved.`
+        });
+      }
+
+      if (replacementOperator) {
+        await Notification.create({
+          user: replacementOperator._id,
+          title: 'New Job Assigned (Reassigned)',
+          message: `You have been automatically assigned to Job #${job.jobId || job._id} in ${replacementOperator.taluk || targetTaluk} Taluk.`
+        });
+      }
+    } else {
+      const jobs = localDb.read('jobs') || [];
+      const idx = jobs.findIndex(j => j._id === id || j.id === id);
+      if (idx !== -1) {
+        jobs[idx] = {
+          ...jobs[idx],
+          cancellationDecision: 'Approved',
+          cancellationDecisionBy: req.user.id,
+          cancellationDecisionAt: new Date().toISOString(),
+          cancellationRequested: false,
+          status: replacementOperator ? 'ASSIGNED' : 'MANUAL_REASSIGNMENT_REQUIRED',
+          operator: replacementOperator ? (replacementOperator._id || replacementOperator.id) : null
+        };
+        localDb.write('jobs', jobs);
+      }
+
+      const notifications = localDb.read('notifications') || [];
+      if (oldOperatorIdRaw) {
+        notifications.push({
+          _id: 'NOTIF-' + Math.floor(1000 + Math.random() * 9000),
+          user: oldOperatorIdRaw,
+          title: 'Cancellation Approved',
+          message: `Your cancellation request for Job #${job.jobId || job._id} has been approved.`,
+          read: false,
+          createdAt: new Date().toISOString()
+        });
+      }
+      if (replacementOperator) {
+        notifications.push({
+          _id: 'NOTIF-' + Math.floor(1000 + Math.random() * 9000),
+          user: replacementOperator._id || replacementOperator.id,
+          title: 'New Job Assigned (Reassigned)',
+          message: `You have been automatically assigned to Job #${job.jobId || job._id} in ${replacementOperator.taluk || targetTaluk} Taluk.`,
+          read: false,
+          createdAt: new Date().toISOString()
+        });
+      }
+      localDb.write('notifications', notifications);
+    }
+
+    await logAudit(
+      req,
+      req.user,
+      'Approved Operator Cancellation',
+      'CANCELLATION_REQUESTED',
+      job.status,
+      `Job #${id} cancellation approved. ${replacementOperator ? `Automatically reassigned to ${replacementOperator.name}` : 'Manual reassignment required.'}`
+    );
+
+    return res.json({ success: true, message: responseMsg, data: job });
+  } catch (err) {
+    console.error('Approve cancellation error:', err);
+    return res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
+});
+
+// POST /api/jobs/:id/reject-cancellation (Staff rejects cancellation)
+router.post('/:id/reject-cancellation', authenticateToken, authorizeRoles('Admin', 'Staff', 'Cooperative Staff'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reason } = req.body;
+
+    if (!reason || !reason.trim()) {
+      return res.status(400).json({ success: false, message: 'Staff rejection reason is required.' });
+    }
+
+    let job;
+    if (isDbConnected()) {
+      job = await Job.findById(id);
+    } else {
+      const jobs = localDb.read('jobs') || [];
+      job = jobs.find(j => j._id === id || j.id === id);
+    }
+
+    if (!job) {
+      return res.status(404).json({ success: false, message: 'Job not found.' });
+    }
+
+    job.cancellationDecision = 'Rejected';
+    job.cancellationDecisionBy = req.user.id;
+    job.cancellationDecisionAt = new Date();
+    job.cancellationDecisionReason = reason;
+    job.cancellationRequested = false;
+    job.status = 'Assigned'; // Job remains assigned to original operator
+
+    if (isDbConnected()) {
+      await job.save();
+
+      if (job.operator) {
+        await Notification.create({
+          user: job.operator,
+          title: 'Cancellation Request Rejected',
+          message: `Your cancellation request for Job #${job.jobId || job._id} was rejected by Cooperative Staff. Reason: ${reason}. Job remains assigned.`
+        });
+      }
+    } else {
+      const jobs = localDb.read('jobs') || [];
+      const idx = jobs.findIndex(j => j._id === id || j.id === id);
+      if (idx !== -1) {
+        jobs[idx] = {
+          ...jobs[idx],
+          cancellationDecision: 'Rejected',
+          cancellationDecisionBy: req.user.id,
+          cancellationDecisionAt: new Date().toISOString(),
+          cancellationDecisionReason: reason,
+          cancellationRequested: false,
+          status: 'Assigned'
+        };
+        localDb.write('jobs', jobs);
+      }
+    }
+
+    await logAudit(req, req.user, 'Rejected Operator Cancellation', 'CANCELLATION_REQUESTED', 'Assigned', `Staff rejected cancellation for Job #${id}. Reason: ${reason}`);
+
+    return res.json({ success: true, message: 'Cancellation request rejected. Job remains assigned to original operator.', data: job });
+  } catch (err) {
+    console.error('Reject cancellation error:', err);
+    return res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
+});
+
+// POST /api/jobs/:id/reassign (Staff manually reassigns job to replacement operator)
+router.post('/:id/reassign', authenticateToken, authorizeRoles('Admin', 'Staff', 'Cooperative Staff'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { operatorId } = req.body;
+
+    if (!operatorId) {
+      return res.status(400).json({ success: false, message: 'Please select a replacement operator.' });
+    }
+
+    let job;
+    let newOpUser;
+
+    if (isDbConnected()) {
+      job = await Job.findById(id);
+      newOpUser = await User.findById(operatorId);
+    } else {
+      const jobs = localDb.read('jobs') || [];
+      job = jobs.find(j => j._id === id || j.id === id);
+      const users = localDb.read('users') || [];
+      newOpUser = users.find(u => u._id === operatorId || u.id === operatorId);
+    }
+
+    if (!job) {
+      return res.status(404).json({ success: false, message: 'Job not found.' });
+    }
+    if (!newOpUser) {
+      return res.status(404).json({ success: false, message: 'Selected operator not found.' });
+    }
+
+    const previousOperator = job.operator;
+    job.operator = operatorId;
+    job.status = 'Assigned';
+    job.assignmentType = 'MANUAL_REASSIGNMENT';
+    job.cancellationRequested = false;
+    job.cancellationDecision = 'Approved';
+
+    if (isDbConnected()) {
+      await job.save();
+
+      // Record Assignment History
+      await AssignmentHistory.create({
+        jobId: job._id,
+        operatorId,
+        assignmentType: 'MANUAL_REASSIGNMENT',
+        assignedBy: req.user.name || req.user.id,
+        assignedAt: new Date(),
+        reason: 'Manual Staff Reassignment'
+      });
+
+      // Notify replacement operator
+      await Notification.create({
+        user: operatorId,
+        title: 'New Job Assigned (Manual Reassignment)',
+        message: `You have been manually assigned to Job #${job.jobId || job._id} by Cooperative Staff.`
+      });
+    } else {
+      const jobs = localDb.read('jobs') || [];
+      const idx = jobs.findIndex(j => j._id === id || j.id === id);
+      if (idx !== -1) {
+        jobs[idx] = {
+          ...jobs[idx],
+          operator: operatorId,
+          status: 'Assigned',
+          assignmentType: 'MANUAL_REASSIGNMENT',
+          cancellationRequested: false,
+          cancellationDecision: 'Approved'
+        };
+        localDb.write('jobs', jobs);
+      }
+    }
+
+    await logAudit(req, req.user, 'Manual Operator Reassignment', String(previousOperator), String(operatorId), `Staff manually reassigned Job #${id} to ${newOpUser.name}`);
+
+    return res.json({ success: true, message: `Job successfully reassigned to operator ${newOpUser.name}.`, data: job });
+  } catch (err) {
+    console.error('Reassign job error:', err);
+    return res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
+});
+
+// POST /api/jobs/:id/report-issue (Operator reports equipment issue during work)
+router.post('/:id/report-issue', authenticateToken, authorizeRoles('Operator', 'Equipment Operator'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { issueType, description, photo } = req.body;
+
+    if (!issueType || !description) {
+      return res.status(400).json({ success: false, message: 'Issue type and description are required.' });
+    }
+
+    let job;
+    if (isDbConnected()) {
+      job = await Job.findById(id);
+    } else {
+      const jobs = localDb.read('jobs') || [];
+      job = jobs.find(j => j._id === id || j.id === id);
+    }
+
+    if (!job) {
+      return res.status(404).json({ success: false, message: 'Job not found.' });
+    }
+
+    job.status = 'EQUIPMENT_FAILURE';
+    job.issueReported = {
+      issueType,
+      description,
+      photo: photo || '',
+      reportedAt: new Date()
+    };
+
+    if (isDbConnected()) {
+      await job.save();
+
+      // Notify Staff
+      const staffUsers = await User.find({ role: { $in: ['Cooperative Staff', 'Admin', 'Manager'] } });
+      for (const st of staffUsers) {
+        await Notification.create({
+          user: st._id,
+          title: '🚨 Equipment Failure Reported',
+          message: `Operator reported equipment issue on Job #${job.jobId || job._id}: ${issueType}`
+        });
+      }
+    } else {
+      const jobs = localDb.read('jobs') || [];
+      const idx = jobs.findIndex(j => j._id === id || j.id === id);
+      if (idx !== -1) {
+        jobs[idx] = {
+          ...jobs[idx],
+          status: 'EQUIPMENT_FAILURE',
+          issueReported: {
+            issueType,
+            description,
+            photo: photo || '',
+            reportedAt: new Date().toISOString()
+          }
+        };
+        localDb.write('jobs', jobs);
+      }
+    }
+
+    await logAudit(req, req.user, 'Operator Reported Equipment Issue', 'IN_PROGRESS', 'EQUIPMENT_FAILURE', `Issue: ${issueType} - ${description}`);
+
+    return res.json({ success: true, message: 'Equipment issue reported to Cooperative Staff.', data: job });
+  } catch (err) {
+    console.error('Report issue error:', err);
+    return res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
+});
+
+export default router;
+
